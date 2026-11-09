@@ -230,8 +230,11 @@ def calibrer():
     with keyboard.Listener(on_press=touche) as l:
         l.join()
 
-    print(T("Encadre UNIQUEMENT le mot violet (COFFRE) puis appuie sur Entrée (C pour annuler).",
-            "Select ONLY the purple word (CHEST), then press Enter (C to cancel)."))
+    # A tight box also matches the other chest types: a wide margin keeps only regular chests.
+    print(T("Encadre TOUT le mot violet (COFFRE) avec une GRANDE marge tout autour, puis appuie sur Entrée "
+            "(C pour annuler). Un cadre trop serré compte aussi les autres types de coffres.",
+            "Select the WHOLE purple word (CHEST) with a WIDE margin all around it, then press Enter "
+            "(C to cancel). A tight box also counts the other chest types."))
     titre = "Calibration"
     cv2.namedWindow(titre, cv2.WINDOW_NORMAL)
     x, y, w, h = cv2.selectROI(titre, capture["img"], showCrosshair=True)

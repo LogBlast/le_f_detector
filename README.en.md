@@ -52,8 +52,11 @@ Setup starts automatically:
 
 1. **Language**: French or English.
 2. **Chests already opened**: `0` (default), `1000` (maximum of the Fortnite quest counter) or your own number.
-3. **Calibration**: start Fortnite, open a chest and press **F9** while the "+XP CHEST" message is on screen. Select **only the purple word** (CHEST, or COFFRE in French), then press Enter.
+3. **Calibration**: start Fortnite, open a chest and press **F9** while the "+XP CHEST" message is on screen. Select **the whole purple word** (CHEST, or COFFRE in French) **with a wide margin all around it**, then press Enter.
 4. **Check** of what is needed to read replays.
+
+> [!WARNING]
+> **Calibration: select the whole word "CHEST" with a wide margin all around it.** That is what makes only regular chests count. A selection that is too tight on the word also matches the other chest types, which then get counted too.
 
 Sprite, rare and broken chests are counted from this first launch on: older matches are ignored.
 

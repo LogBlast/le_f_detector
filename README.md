@@ -52,8 +52,11 @@ La configuration se lance toute seule :
 
 1. **Langue** : français ou anglais.
 2. **Nombre de coffres déjà ouverts** : `0` (par défaut), `1000` (maximum du compteur de la quête Fortnite) ou ton propre nombre.
-3. **Calibrage** : lance Fortnite, ouvre un coffre et appuie sur **F9** pendant que le message « +XP COFFRE » est affiché. Encadre **uniquement le mot violet** (COFFRE, ou CHEST en anglais) puis appuie sur Entrée.
+3. **Calibrage** : lance Fortnite, ouvre un coffre et appuie sur **F9** pendant que le message « +XP COFFRE » est affiché. Encadre **tout le mot violet** (COFFRE, ou CHEST en anglais) **avec une grande marge tout autour**, puis appuie sur Entrée.
 4. **Vérification** de ce qu'il faut pour lire les replays.
+
+> [!WARNING]
+> **Calibrage : prends tout le mot « COFFRE » avec une grande marge tout autour.** C'est ce qui permet de ne compter que les coffres classiques. Un cadre trop serré sur le mot reconnaît aussi les autres types de coffres, qui seront alors comptés en trop.
 
 Les coffres à esprit, rares et cassés sont comptés à partir de ce premier lancement : les parties plus anciennes sont ignorées.
 
