@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>FortniteReplayReader</AssemblyName>
+    <RootNamespace>FortniteReplayReader</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Unreal.Core\Unreal.Core.csproj" />
+    <ProjectReference Include="..\Unreal.Encryption\Unreal.Encryption.csproj" />
+  </ItemGroup>
+</Project>

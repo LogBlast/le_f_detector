@@ -1,0 +1,37 @@
+# Données de l'utilisateur / user data
+data/
+
+# Fichiers des premières versions (déplacés automatiquement dans data/)
+config.json
+modele_coffre.png
+compteur.json
+compteur.txt
+replays_suivi.json
+replays_coffres.json
+
+# Replays Fortnite
+replay/
+*.replay
+
+# Lecteur compilé (build.bat, ou zip des Releases) / built reader
+lecteur/
+
+# Build .NET
+bin/
+obj/
+*.user
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Éditeurs / systèmes
+.vs/
+.vscode/
+.idea/
+Claude outputs/
+*.tmp
+Thumbs.db
+.DS_Store
