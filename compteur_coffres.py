@@ -285,7 +285,11 @@ def surveiller(etat, zone, modele):
 def debut_replay(nom):
     """Heure de début de la partie, lue dans le nom du replay (UnsavedReplay-2026.11.09-22.37.34)."""
     m = re.search(r"(\d{4})\.(\d{2})\.(\d{2})-(\d{2})\.(\d{2})\.(\d{2})", nom)
-    return time.mktime(tuple(int(x) for x in m.groups()) + (0, 0, -1)) if m else None
+    try:
+        return time.mktime(tuple(int(x) for x in m.groups()) + (0, 0, -1)) if m else None
+    except (OverflowError, ValueError):
+        # Untrusted file name (downloaded/renamed replay): an out-of-range date must not kill the replay thread.
+        return None
 
 
 def totaux_replays(resultats):
