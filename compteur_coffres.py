@@ -98,7 +98,7 @@ def lire_json(chemin, defaut=None):
 
 def ecrire_json(chemin, valeur):
     DATA.mkdir(exist_ok=True)
-    tmp = Path(str(chemin) + ".tmp")
+    tmp = Path(f"{chemin}.{threading.get_ident()}.tmp")  # un fichier temporaire par thread : jamais partagé
     tmp.write_text(json.dumps(valeur, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(chemin)
 
@@ -123,7 +123,7 @@ def migrer_anciens_fichiers():
 
 
 # ---------- compteur ----------
-VERROU = threading.Lock()  # la détection écran et la correction replay modifient le compteur en parallèle
+VERROU = threading.RLock()  # la détection écran, la correction replay et l'arrêt modifient le compteur en parallèle
 
 
 def charger_etat():
@@ -132,11 +132,12 @@ def charger_etat():
 
 
 def sauver(etat):
-    limite = time.time() - 3 * 86400  # on garde 3 jours de détections
-    etat["detections"] = [t for t in etat["detections"] if t > limite]
-    ecrire_json(SAUVEGARDE, {"total": etat["total"], "maj": time.strftime("%Y-%m-%d %H:%M:%S"),
-                             "detections": etat["detections"]})
-    TEXTE_OBS.write_text(T(f"Coffres : {etat['total']}", f"Chests: {etat['total']}"), encoding="utf-8")
+    with VERROU:
+        limite = time.time() - 3 * 86400  # on garde 3 jours de détections
+        etat["detections"] = [t for t in etat["detections"] if t > limite]
+        ecrire_json(SAUVEGARDE, {"total": etat["total"], "maj": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                 "detections": etat["detections"]})
+        TEXTE_OBS.write_text(T(f"Coffres : {etat['total']}", f"Chests: {etat['total']}"), encoding="utf-8")
 
 
 def ajouter_coffre(etat, n=1):
@@ -557,6 +558,23 @@ def localiser(mini, carte, avant=None):
     return best
 
 
+def contraste(img):
+    """Gris à contraste local égalisé : garde les formes (côtes, cratère, routes) quand la tempête teinte tout en violet."""
+    return cv2.createCLAHE(2.0, (8, 8)).apply(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+
+
+def trouver(mini, cartes, avant):
+    """Position de la minicarte : en couleur d'abord, puis en contraste (tempête) ; autour de la position précédente,
+    puis partout si on l'a perdue (téléportation, carte ouverte...). None si rien ne ressemble assez."""
+    images = ((mini, cartes[0]), (contraste(mini), cartes[1]))
+    for precedent in ((avant, None) if avant else (None,)):  # les recherches rapides d'abord
+        for image, carte in images:
+            r = localiser(image, carte, precedent)
+            if r and r[0] >= 0.5:
+                return r
+    return None
+
+
 def suivre_minicarte(etat):
     """Option minicarte : ta position vient de la minicarte du jeu, lue à l'écran (comme le message « +XP COFFRE ») et
     retrouvée dans l'image de la carte. Les coffres ouverts cette partie sont ceux comptés à l'écran, à ta position."""
@@ -568,16 +586,14 @@ def suivre_minicarte(etat):
                 "Minimap: first run  py compteur_coffres.py map  then  py compteur_coffres.py minimap-setup"))
         return
     carte_img = cv2.imread(str(image))
+    cartes = (carte_img, contraste(carte_img))
     avant, ouverts, partie, vus = None, [], None, len(etat["detections"])
     with MSS() as sct:
         mon = sct.monitors[ECRAN]
         region = {"left": mon["left"] + zone["x"], "top": mon["top"] + zone["y"], "width": zone["w"], "height": zone["h"]}
         while not etat.get("fin"):
             mini = cv2.cvtColor(np.array(sct.grab(region)), cv2.COLOR_BGRA2BGR)
-            trouve = localiser(mini, carte_img, avant)
-            if avant and (not trouve or trouve[0] < 0.5):  # perdu (téléportation, carte ouverte...) : on cherche partout
-                trouve = localiser(mini, carte_img)
-            avant = trouve if trouve and trouve[0] >= 0.5 else None
+            avant = trouver(mini, cartes, avant)
             if etat.get("debut_partie") != partie:  # nouvelle partie : plus aucun coffre ouvert
                 partie, ouverts = etat.get("debut_partie"), []
             pos = vers_metres(*avant[2]) if avant else None
@@ -781,6 +797,17 @@ def compter():
                 "Not calibrated yet: py compteur_coffres.py calibrate"))
         return
     modele = masque_violet(cv2.imread(str(MODELE)))
+    # Un seul compteur à la fois : deux compteurs comptent chaque coffre deux fois et écrasent la sauvegarde
+    # l'un de l'autre. Le verrou est libéré par Windows quand le programme s'arrête, même s'il plante.
+    import msvcrt
+    DATA.mkdir(exist_ok=True)
+    instance = open(DATA / "compteur.lock", "w")
+    try:
+        msvcrt.locking(instance.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        print(T("Le compteur est déjà lancé dans une autre fenêtre : ferme-la d'abord.",
+                "The counter is already running in another window: close it first."))
+        return
     etat = charger_etat()
     sauver(etat)
 
