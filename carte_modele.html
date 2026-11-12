@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<!-- Template for "py compteur_coffres.py carte": the script replaces DONNEES and writes data/carte.html -->
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>le_f_detector — carte des coffres</title>
+<style>
+  body { margin: 0; font: 14px "Segoe UI", sans-serif; background: #1c1c28; color: #e8e8f0; display: flex; gap: 16px; padding: 16px; }
+  canvas { background: #12121a; border-radius: 10px; cursor: crosshair; width: auto; height: min(calc(100vh - 32px), calc(100vw - 350px)); }
+  aside { width: 300px; display: flex; flex-direction: column; gap: 12px; }
+  h1 { font-size: 18px; margin: 0; color: #ffd23f; }
+  .bloc { background: #262636; border-radius: 8px; padding: 10px 12px; }
+  .gris { color: #9a9ab0; font-size: 12px; }
+  button { background: #33334a; color: #e8e8f0; border: 1px solid #4a4a66; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  label { display: block; margin: 4px 0; }
+  input[type=range] { width: 100%; }
+  #etapes { font-family: Consolas, monospace; font-size: 13px; line-height: 1.6; }
+  .puce { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1920"></canvas>
+<aside>
+  <h1>Carte des coffres</h1>
+  <div class="bloc gris" id="resume"></div>
+  <div class="bloc">
+    <div class="gris">Molette : zoomer. Glisser : se déplacer.</div>
+    <div style="margin-top:6px;display:flex;gap:6px">
+      <button id="zoomPlus" aria-label="Zoomer">+</button><button id="zoomMoins" aria-label="Dézoomer">−</button><button id="vueEntiere">Vue entière</button>
+    </div>
+  </div>
+  <div class="bloc">
+    <label><input type="checkbox" id="spots" checked> Spots de coffres (tous les joueurs)</label>
+    <label><input type="checkbox" id="partie" checked> Dernière partie (trajet + coffres)</label>
+    <div class="gris" style="margin-top:6px">
+      <span class="puce" style="background:#ffb020"></span>normal
+      <span class="puce" style="background:#9b8cff;margin-left:8px"></span>rare
+      <span class="puce" style="background:#2fd39a;margin-left:8px"></span>esprit
+      <span class="puce" style="background:#9a9ab0;margin-left:8px"></span>autre / cassé
+    </div>
+  </div>
+  <div class="bloc">
+    <b>Chemin conseillé</b>
+    <div class="gris">Clique sur la carte là où tu atterris.</div>
+    <label>Distance max : <span id="budgetOut"></span></label>
+    <input type="range" id="budget" min="100" max="3000" step="50" value="800">
+    <div id="etapes" class="gris"></div>
+  </div>
+  <div class="bloc">
+    <label><input type="checkbox" id="calage"> Caler la carte</label>
+    <div class="gris">Tant que c'est coché, glisser déplace les points et la molette change leur échelle, jusqu'à ce que tes trajets suivent les routes. Le réglage est gardé.</div>
+    <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+      <button id="pivoter">Pivoter</button><button id="miroir">Miroir</button><button id="reinit">Réinitialiser</button>
+    </div>
+  </div>
+</aside>
+<script>
+const D = /*DONNEES*/null;
+const COUL = ["#ffb020", "#9b8cff", "#2fd39a", "#9a9ab0"];
+const ORIENT = [[1,0,0,1],[0,-1,1,0],[-1,0,0,-1],[0,1,-1,0],[-1,0,0,1],[0,1,1,0],[1,0,0,-1],[0,-1,-1,0]];
+const DEFAUT = D.calage;  // CALAGE_CARTE in compteur_coffres.py, shared with the live minimap
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const $ = id => document.getElementById(id);
+let cal = Object.assign({}, DEFAUT, JSON.parse(localStorage.getItem("carte-calage-v2") || "{}"));
+let depart = null, img = null;
+let vue = { z: 1, x: 0, y: 0 };  // zoom, and image pixel shown at the top-left corner
+
+if (D.image) { img = new Image(); img.onload = dessiner; img.src = D.image; }
+
+// replay metres -> image pixels
+function px(x, y) { const m = ORIENT[cal.o]; return [cal.s * (m[0] * x + m[1] * y) + cal.tx, cal.s * (m[2] * x + m[3] * y) + cal.ty]; }
+function metres(X, Y) {
+  const m = ORIENT[cal.o], u = (X - cal.tx) / cal.s, v = (Y - cal.ty) / cal.s;
+  return [m[0] * u + m[2] * v, m[1] * u + m[3] * v];  // orientation matrices are orthogonal: inverse = transpose
+}
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+const longueur = p => p.reduce((s, q, i) => i ? s + dist(p[i - 1], q) : 0, 0);
+
+function deuxOpt(p) {
+  for (let mieux = true; mieux;) {
+    mieux = false;
+    for (let i = 1; i < p.length - 1; i++) for (let k = i + 1; k < p.length; k++) {
+      const n = p[k + 1];
+      const delta = dist(p[i - 1], p[k]) + (n ? dist(p[i], n) : 0) - dist(p[i - 1], p[i]) - (n ? dist(p[k], n) : 0);
+      if (delta < -1e-6) { p.splice(i, k - i + 1, ...p.slice(i, k + 1).reverse()); mieux = true; }
+    }
+  }
+  return p;
+}
+
+// Most chests within the distance: cheapest insertion, then 2-opt, until the next chest no longer fits
+function chemin(budget) {
+  let p = [depart], reste = D.spots.map(s => [s[0], s[1]]);
+  while (true) {
+    let best = null;
+    for (const c of reste) for (let i = 1; i <= p.length; i++) {
+      const a = p[i - 1], b = p[i], cout = dist(a, c) + (b ? dist(c, b) - dist(a, b) : 0);
+      if (!best || cout < best.cout) best = { c, i, cout };
+    }
+    if (!best) break;
+    const essai = p.slice(); essai.splice(best.i, 0, best.c); deuxOpt(essai);
+    if (longueur(essai) > budget) break;
+    p = essai; reste = reste.filter(c => c !== best.c);
+  }
+  return p;
+}
+
+// Sizes shrink with the zoom, but less than it: dots grow a little on screen when zooming in
+const taille = v => v / Math.sqrt(vue.z);
+function point(x, y, r, coul) { const [X, Y] = px(x, y); ctx.beginPath(); ctx.arc(X, Y, taille(r), 0, 7); ctx.fillStyle = coul; ctx.fill(); }
+
+function dessiner() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(vue.z, 0, 0, vue.z, -vue.x * vue.z, -vue.y * vue.z);
+  if (img) ctx.drawImage(img, 0, 0, cv.width, cv.height);
+  ctx.lineWidth = 3; ctx.strokeStyle = "rgba(0,0,0,.6)";
+  if ($("spots").checked) for (const [x, y, t, n] of D.spots) { point(x, y, 5 + Math.sqrt(n) * 2.2, "rgba(0,0,0,.45)"); point(x, y, 4 + Math.sqrt(n) * 2, COUL[t]); }
+  if ($("partie").checked && D.partie) {
+    ctx.beginPath(); D.partie.joueur.forEach(([x, y], i) => { const [X, Y] = px(x, y); i ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); });
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = taille(4); ctx.stroke();
+    for (const [x, y, t] of D.partie.coffres) { point(x, y, 11, "#000"); point(x, y, 9, COUL[t]); }
+  }
+  const budget = +$("budget").value;
+  $("budgetOut").textContent = budget + " m";
+  if (depart) {
+    const p = chemin(budget);
+    ctx.beginPath(); p.forEach(([x, y], i) => { const [X, Y] = px(x, y); i ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); });
+    ctx.strokeStyle = "#3fa9ff"; ctx.lineWidth = taille(6); ctx.stroke();
+    ctx.font = "bold " + taille(26) + "px Segoe UI"; ctx.fillStyle = "#fff";
+    p.slice(1).forEach(([x, y], i) => { const [X, Y] = px(x, y); ctx.fillText(i + 1, X + taille(12), Y - taille(10)); });
+    point(depart[0], depart[1], 14, "#3fa9ff");
+    const etapes = p.slice(1).map((q, i) => (i + 1) + " : " + (i ? "+" : "") + Math.round(dist(p[i], q)) + " m");
+    $("etapes").textContent = etapes.length ? p.length - 1 + " coffres, " + Math.round(longueur(p)) + " m — " + etapes.join("  ") : "Aucun spot à portée : augmente la distance.";
+  }
+}
+
+function sauver() { localStorage.setItem("carte-calage-v2", JSON.stringify(cal)); dessiner(); }
+// Mouse position in canvas pixels, then in image pixels (through the zoom)
+function versCanvas(e) { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) * cv.width / r.width, (e.clientY - r.top) * cv.height / r.height]; }
+function versImage(e) { const [X, Y] = versCanvas(e); return [vue.x + X / vue.z, vue.y + Y / vue.z]; }
+
+// Zoom from 1x to 12x, keeping the image point under (cx, cy) in place; the view never leaves the image
+function zoomer(f, cx = cv.width / 2, cy = cv.height / 2) {
+  const X = vue.x + cx / vue.z, Y = vue.y + cy / vue.z;
+  vue.z = Math.min(12, Math.max(1, vue.z * f));
+  deplacer(X - cx / vue.z, Y - cy / vue.z);
+}
+function deplacer(x, y) {
+  const max = cv.width - cv.width / vue.z;
+  vue.x = Math.min(max, Math.max(0, x)); vue.y = Math.min(max, Math.max(0, y));
+  cv.style.cursor = $("calage").checked ? "move" : vue.z > 1 ? "grab" : "crosshair";
+  dessiner();
+}
+
+let glisse = null, bouge = 0;
+cv.addEventListener("mousedown", e => { glisse = versCanvas(e); bouge = 0; });
+addEventListener("mouseup", () => glisse = null);
+cv.addEventListener("mousemove", e => {
+  if (!glisse) return;
+  const [X, Y] = versCanvas(e), dx = (X - glisse[0]) / vue.z, dy = (Y - glisse[1]) / vue.z;
+  glisse = [X, Y]; bouge += Math.abs(dx) + Math.abs(dy);
+  if ($("calage").checked) { cal.tx += dx; cal.ty += dy; sauver(); }
+  else deplacer(vue.x - dx, vue.y - dy);
+});
+cv.addEventListener("wheel", e => {
+  e.preventDefault();
+  const f = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  if (!$("calage").checked) return zoomer(f, ...versCanvas(e));
+  const [X, Y] = versImage(e), g = e.deltaY < 0 ? 1.02 : 1 / 1.02;
+  cal.tx = X - (X - cal.tx) * g; cal.ty = Y - (Y - cal.ty) * g; cal.s *= g; sauver();  // scale the dots around the cursor
+}, { passive: false });
+// A click places the landing point; the end of a drag does not
+cv.addEventListener("click", e => { if (!$("calage").checked && bouge < 5 / vue.z) { depart = metres(...versImage(e)); dessiner(); } });
+$("zoomPlus").onclick = () => zoomer(1.5);
+$("zoomMoins").onclick = () => zoomer(1 / 1.5);
+$("vueEntiere").onclick = () => { vue.z = 1; deplacer(0, 0); };
+$("calage").addEventListener("change", () => deplacer(vue.x, vue.y));
+// Rotate / mirror around the middle of the spots, so the points stay in view
+function autourDuCentre(changer) {
+  const n = D.spots.length || 1, mx = D.spots.reduce((s, p) => s + p[0], 0) / n, my = D.spots.reduce((s, p) => s + p[1], 0) / n;
+  const [a, b] = px(mx, my); changer(); const [c, d] = px(mx, my);
+  cal.tx += a - c; cal.ty += b - d; sauver();
+}
+$("pivoter").onclick = () => autourDuCentre(() => cal.o = (cal.o & 4) | ((cal.o + 1) & 3));
+$("miroir").onclick = () => autourDuCentre(() => cal.o ^= 4);
+$("reinit").onclick = () => { cal = Object.assign({}, DEFAUT); sauver(); };
+for (const id of ["spots", "partie", "budget"]) $(id).addEventListener("input", dessiner);
+
+$("resume").textContent = D.parties + " parties lues, " + D.ouvertures + " coffres ouverts (toi et les joueurs autour), " + D.spots.length + " spots."
+  + (D.image ? "" : " Pas d'image de fond : mets la carte du jeu dans data/carte.png (ou .jpg / .webp).");
+dessiner();
+</script>
+</body>
+</html>

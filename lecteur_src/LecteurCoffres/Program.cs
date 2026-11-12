@@ -4,9 +4,11 @@
 // Décodage des replays : bibliothèque FortniteReplayDecompressor (Shiqan, licence MIT), avec les correctifs
 // de LED-N/Fortnite-ChestCounter (licence MIT) — voir lib/. La logique de comptage ci-dessous est propre à ce projet.
 //
-// Usage : LecteurCoffres <fichier.replay> [<fichier2.replay> ...]
+// Usage : LecteurCoffres [--positions] <fichier.replay> [<fichier2.replay> ...]
+//   --positions : ajoute les coordonnées des coffres et le trajet du joueur (option, analyse plus lente)
 
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using FortniteReplayReader.Models;
 using FortniteReplayReader.Models.NetFieldExports;
 using FortniteReplayReader.Models.NetFieldExports.Items;
@@ -15,19 +17,21 @@ using Unreal.Core.Contracts;
 using Unreal.Core.Models;
 using Unreal.Core.Models.Enums;
 
-foreach (var fichier in args)
+var positions = args.Contains("--positions");
+var json = new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
+foreach (var fichier in args.Where(a => a != "--positions"))
 {
     object resultat;
     try
     {
         using var flux = File.Open(fichier, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        resultat = new Lecteur().Analyser(flux, Path.GetFileName(fichier));
+        resultat = new Lecteur(positions).Analyser(flux, Path.GetFileName(fichier));
     }
     catch (Exception e)
     {
         resultat = new { fichier = Path.GetFileName(fichier), erreur = e.GetType().Name + ": " + e.Message };
     }
-    Console.WriteLine(JsonSerializer.Serialize(resultat));
+    Console.WriteLine(JsonSerializer.Serialize(resultat, json));
 }
 return 0;
 
@@ -77,7 +81,12 @@ sealed class Lecteur : FortniteReplayReader.ReplayReader
     private readonly Dictionary<uint, uint> _pionVersEtat = new();
     private readonly Dictionary<uint, int> _etatVersId = new();
 
-    public Lecteur() : base(null, ParseMode.Normal) { }
+    // --positions : trajet de chaque pion (un point par seconde)
+    private readonly bool _positions;
+    private readonly Dictionary<uint, List<(float T, double X, double Y)>> _trajets = new();
+
+    // Le mode Full est nécessaire pour lire les déplacements du joueur (ReplicatedMovement), mais il est plus lent.
+    public Lecteur(bool positions = false) : base(null, positions ? ParseMode.Full : ParseMode.Normal) => _positions = positions;
 
     private string Chemin(uint? guid) => guid is uint g && g != 0 && _netGuidCache.TryGetPathName(g, out var p) ? p : "";
 
@@ -111,6 +120,11 @@ sealed class Lecteur : FortniteReplayReader.ReplayReader
     protected override void OnExportRead(uint canal, INetFieldExportGroup? groupe)
     {
         base.OnExportRead(canal, groupe);
+        if (_positions && groupe is PlayerPawn p && p.ReplicatedMovement is { Location: { } loc } && Channels[canal]?.ActorId is uint idTrajet)
+        {
+            if (!_trajets.TryGetValue(idTrajet, out var trajet)) _trajets[idTrajet] = trajet = new();
+            if (trajet.Count == 0 || Maintenant - trajet[^1].T >= 1f) trajet.Add((Maintenant, loc.X, loc.Y));
+        }
         switch (groupe)
         {
             case BaseContainer coffre:
@@ -197,6 +211,30 @@ sealed class Lecteur : FortniteReplayReader.ReplayReader
             rare = coffres.Count(c => !c.Casse && c.Type == Types.Rare),
             casse = coffres.Count(c => c.Casse),
             details = coffres.Select(c => new { t = MathF.Round(c.Temps, 1), type = c.Type, nom = c.Nom, casse = c.Casse }),
+            positions = _positions ? Positions(mesPions) : null,
+        };
+    }
+
+    /// <summary>Coordonnées Unreal (cm) pour la carte : coffres ouverts par tous les joueurs visibles, et ton trajet.</summary>
+    private object Positions(HashSet<uint> mesPions)
+    {
+        // Les coffres fixes de la carte n'ont pas de position dans le replay : on prend celle du joueur qui l'ouvre
+        (double X, double Y)? Ou(uint pion, float t)
+        {
+            if (!_trajets.TryGetValue(pion, out var trajet)) return null;
+            var i = trajet.FindLastIndex(p => p.T <= t);
+            return i >= 0 ? (trajet[i].X, trajet[i].Y) : null;
+        }
+        return new
+        {
+            fouilles = _fouilles.Where(f => Types.Classer(f.Nom) != Types.PasCoffre)
+                .Select(f => (f, ou: Ou(f.Pion, f.Temps))).Where(x => x.ou != null).Select(x => new
+                {
+                    t = MathF.Round(x.f.Temps, 1), type = Types.Classer(x.f.Nom), casse = x.f.Casse,
+                    moi = mesPions.Contains(x.f.Pion), x = Math.Round(x.ou!.Value.X), y = Math.Round(x.ou!.Value.Y),
+                }),
+            joueur = _trajets.Where(kv => mesPions.Contains(kv.Key)).SelectMany(kv => kv.Value).OrderBy(p => p.T)
+                .Select(p => new { t = MathF.Round(p.T, 1), x = Math.Round(p.X), y = Math.Round(p.Y) }),
         };
     }
 }

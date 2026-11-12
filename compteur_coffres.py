@@ -9,13 +9,16 @@ Commandes :
     py compteur_coffres.py              lancer le compteur (configuration au premier lancement)
     py compteur_coffres.py calibrer     refaire le calibrage de la détection
     py compteur_coffres.py config       refaire la configuration (langue, nombre de départ, calibrage)
-Options : debug (affiche la ressemblance en direct), sans-overlay (pas de compteur à l'écran)
+    py compteur_coffres.py carte        option : carte de tes coffres et chemin conseillé (data/carte.html)
+Options : debug (affiche la ressemblance en direct), sans-overlay (pas de compteur à l'écran),
+          minicarte (carte en direct dans le compteur, avec les 3 prochains coffres ; minicarte-config avant)
 Raccourcis : F8 = +1   F7 = -1   F10 / Ctrl+C = quitter
 
 Voir README.md pour l'installation.
 """
 
 import json
+import math
 import os
 import re
 import shutil
@@ -43,6 +46,9 @@ MODELE = DATA / "modele_coffre.png"              # mot violet capturé au calibr
 SAUVEGARDE = DATA / "compteur.json"              # total + heure de chaque coffre compté
 TEXTE_OBS = DATA / "compteur.txt"                # pour une source texte OBS
 RESULTATS_REPLAYS = DATA / "replays.json"        # début du suivi + résultat de chaque replay
+POSITIONS = DATA / "positions.json"              # option carte : positions lues dans chaque replay
+CARTE = DATA / "carte.html"                      # option carte : page générée depuis carte_modele.html
+MINICARTE_ZONE = DATA / "minicarte.json"         # option minicarte : emplacement de la minicarte à l'écran
 LECTEUR = DOSSIER / "lecteur" / "LecteurCoffres.dll"
 DOSSIER_DEMOS = Path(os.environ.get("LOCALAPPDATA", "")) / "FortniteGame" / "Saved" / "Demos"
 
@@ -57,9 +63,16 @@ CORRIGER_AVEC_REPLAY = True  # en fin de partie, le nombre de coffres ouverts es
 # Chance d'obtenir Pirate Shop Access par coffre en partie normale : 1 sur 137 500 (taux donné par
 # Fortnite Status). Les "Treasure Hours" augmentent ce taux : non pris en compte.
 CHANCE_TOKEN = 1 / 137_500
+# Option carte : replay (mètres) -> pixels de data/carte.*. Calé sur l'image officielle 1920 px de la saison de
+# novembre 2026 avec la formule de fortnite.gg (carré de 3 km, X vers la droite, Y vers le bas) et le contour de l'île.
+# o = orientation (0..7, voir ORIENT), s = pixels par mètre, tx / ty = décalage. Nouvelle image : recaler.
+CALAGE_CARTE = {"o": 0, "s": 0.85, "tx": 811, "ty": 786}
+ORIENT = [(1, 0, 0, 1), (0, -1, 1, 0), (-1, 0, 0, -1), (0, 1, -1, 0), (-1, 0, 0, 1), (0, 1, 1, 0), (1, 0, 0, -1), (0, -1, -1, 0)]
+MINIMAP_METRES = 300         # côté de la zone affichée par la minicarte en direct
 
 ARGS = [a.lower() for a in sys.argv[1:]]
 DEBUG = "debug" in ARGS
+MINICARTE = "minimap" in ARGS or "minicarte" in ARGS
 
 # Couleur violette du mot "COFFRE" / "CHEST" (HSV d'OpenCV)
 VIOLET_BAS = np.array([122, 110, 130])
@@ -216,9 +229,8 @@ def masque_violet(img_bgr):
     return cv2.GaussianBlur(cv2.inRange(hsv, VIOLET_BAS, VIOLET_HAUT), (5, 5), 0)
 
 
-def calibrer():
-    print(T("Dans Fortnite, ouvre un coffre et appuie sur F9 pendant que le message « +XP COFFRE » est affiché...",
-            "In Fortnite, open a chest and press F9 while the \"+XP CHEST\" message is on screen..."))
+def capture_f9():
+    """Attend F9 et renvoie une capture de l'écran du jeu."""
     capture = {}
 
     def touche(k):
@@ -229,21 +241,50 @@ def calibrer():
 
     with keyboard.Listener(on_press=touche) as l:
         l.join()
+    return capture["img"]
 
-    # A tight box also matches the other chest types: a wide margin keeps only regular chests.
-    print(T("Encadre TOUT le mot violet (COFFRE) avec une GRANDE marge tout autour, puis appuie sur Entrée "
-            "(C pour annuler). Un cadre trop serré compte aussi les autres types de coffres.",
-            "Select the WHOLE purple word (CHEST) with a WIDE margin all around it, then press Enter "
-            "(C to cancel). A tight box also counts the other chest types."))
-    titre = "Calibration"
-    cv2.namedWindow(titre, cv2.WINDOW_NORMAL)
-    x, y, w, h = cv2.selectROI(titre, capture["img"], showCrosshair=True)
+
+def selection(img, consigne):
+    """L'utilisateur encadre une zone de img ; renvoie (x, y, w, h) ou None."""
+    print(consigne)
+    cv2.namedWindow("Calibration", cv2.WINDOW_NORMAL)
+    x, y, w, h = cv2.selectROI("Calibration", img, showCrosshair=True)
     cv2.destroyAllWindows()
     if w == 0 or h == 0:
         print(T("Rien sélectionné, recommence.", "Nothing selected, try again."))
-        return False
+        return None
+    return int(x), int(y), int(w), int(h)
 
-    morceau = capture["img"][y:y + h, x:x + w]
+
+def configurer_minicarte():
+    """Option minicarte : enregistre l'emplacement de la minicarte à l'écran."""
+    print(T("Dans une partie, appuie sur F9 (la minicarte doit être visible).",
+            "In a match, press F9 (the minimap must be visible)."))
+    img = capture_f9()
+    zone = selection(img, T("Encadre exactement le carré de la minicarte, sans le cadre, puis Entrée.",
+                            "Select exactly the minimap square, without its frame, then Enter."))
+    if not zone:
+        return
+    x, y, w, h = zone
+    DATA.mkdir(exist_ok=True)
+    ecrire_json(MINICARTE_ZONE, {"x": x, "y": y, "w": w, "h": h})
+    print(T("✔ Minicarte configurée.", "✔ Minimap set up."))
+
+
+def calibrer():
+    print(T("Dans Fortnite, ouvre un coffre et appuie sur F9 pendant que le message « +XP COFFRE » est affiché...",
+            "In Fortnite, open a chest and press F9 while the \"+XP CHEST\" message is on screen..."))
+    img = capture_f9()
+
+    # A tight box also matches the other chest types: a wide margin keeps only regular chests.
+    zone = selection(img, T("Encadre TOUT le mot violet (COFFRE) avec une GRANDE marge tout autour, puis appuie sur "
+                            "Entrée (C pour annuler). Un cadre trop serré compte aussi les autres types de coffres.",
+                            "Select the WHOLE purple word (CHEST) with a WIDE margin all around it, then press Enter "
+                            "(C to cancel). A tight box also counts the other chest types."))
+    if not zone:
+        return False
+    x, y, w, h = zone
+    morceau = img[y:y + h, x:x + w]
     if cv2.countNonZero(cv2.inRange(cv2.cvtColor(morceau, cv2.COLOR_BGR2HSV), VIOLET_BAS, VIOLET_HAUT)) < 30:
         print(T("Pas de texte violet dans ta sélection : encadre bien le mot violet.",
                 "No purple text in your selection: select the purple word."))
@@ -392,6 +433,194 @@ def analyser_replays(etat):
         time.sleep(3)
 
 
+# ---------- option carte ----------
+TYPES_CARTE = {"normal": 0, "rare": 1, "esprit": 2}  # 3 = autre ou cassé
+
+
+def lire_positions(dotnet, positions):
+    """Lit (une seule fois) les positions des replays terminés : ton trajet, tes coffres et ceux de tous les
+    joueurs visibles dans le replay, en mètres."""
+    a_lire = []
+    for f in DOSSIER_DEMOS.glob("*.replay") if DOSSIER_DEMOS.exists() else []:
+        try:
+            st = f.stat()
+        except OSError:  # Fortnite supprime les vieux replays : le fichier a pu disparaître entre-temps
+            continue
+        # "tous" absent : lu par une version qui ne gardait que tes coffres -> on relit
+        if "tous" not in positions.get(f"{f.name}|{st.st_size}", {}) and time.time() - st.st_mtime > 6:
+            a_lire.append((st.st_mtime, f, f"{f.name}|{st.st_size}"))
+    a_lire = [(f, cle) for _, f, cle in sorted(a_lire)]  # du plus ancien au plus récent : la dernière partie à la fin
+    if a_lire:
+        print(T(f"Lecture des positions dans {len(a_lire)} replay(s)...", f"Reading positions from {len(a_lire)} replay(s)..."))
+    for i in range(0, len(a_lire), 20):  # par lots : un seul lancement de dotnet pour 20 replays
+        lot = dict(a_lire[i:i + 20])
+        try:
+            sortie = subprocess.run([dotnet, str(LECTEUR), "--positions", *map(str, lot)], capture_output=True,
+                                    text=True, stdin=subprocess.DEVNULL, timeout=600).stdout
+        except subprocess.TimeoutExpired:
+            continue
+        cles = {f.name: cle for f, cle in lot.items()}
+        for ligne in sortie.splitlines():
+            try:  # sortie du lecteur = donnée externe : une ligne illisible est ignorée, pas fatale
+                r = json.loads(ligne)
+            except json.JSONDecodeError:
+                continue
+            pos = r.get("positions")
+            if r.get("fichier") not in cles or r.get("en_cours") or not pos:
+                continue
+            joueur = [[round(p["x"] / 100), round(p["y"] / 100)] for p in pos["joueur"][::2]]
+            # avant le saut : île d'attente puis bus, à des kilomètres de là -> on garde après le premier grand saut
+            saut = next((j for j in range(1, len(joueur)) if abs(joueur[j][0] - joueur[j - 1][0]) + abs(joueur[j][1] - joueur[j - 1][1]) > 500), 0)
+            fouilles = [(c["moi"], [round(c["x"] / 100), round(c["y"] / 100), 3 if c["casse"] else TYPES_CARTE.get(c["type"], 3)])
+                        for c in pos["fouilles"]]
+            positions[cles[r["fichier"]]] = {
+                "debut": r.get("debut"),
+                "coffres": [c for moi, c in fouilles if moi],
+                "tous": [c for _, c in fouilles],
+                "joueur": joueur[saut:],
+            }
+        ecrire_json(POSITIONS, positions)
+    return positions
+
+
+def spots_carte(positions):
+    """Emplacements de coffres [x, y, type le plus fréquent, nombre d'ouvertures] : ouvertures à moins de 6 m
+    l'une de l'autre (position du joueur à l'ouverture, donc à quelques mètres du coffre)."""
+    spots = []  # [x, y, compteurs par type]
+    for p in positions.values():
+        for x, y, t in p["tous"]:
+            s = next((s for s in spots if (s[0] - x) ** 2 + (s[1] - y) ** 2 <= 36), None)
+            if not s:
+                spots.append(s := [x, y, [0, 0, 0, 0]])
+            s[2][t] += 1
+    return [[x, y, n.index(max(n)), sum(n)] for x, y, n in spots]
+
+
+def vers_carte(x, y, cal=CALAGE_CARTE):
+    """Mètres du replay -> pixels de l'image de la carte."""
+    a, b, c, d = ORIENT[cal["o"]]
+    return cal["s"] * (a * x + b * y) + cal["tx"], cal["s"] * (c * x + d * y) + cal["ty"]
+
+
+def prochains(pos, spots, ouverts, n=3):
+    """Les n prochains coffres à faire depuis pos, du plus proche en plus proche, sans ceux déjà ouverts
+    cette partie (à moins de 6 m d'une de tes ouvertures)."""
+    reste = [s[:2] for s in spots if all((s[0] - o[0]) ** 2 + (s[1] - o[1]) ** 2 > 36 for o in ouverts)]
+    chemin = []
+    while reste and len(chemin) < n:
+        pos = min(reste, key=lambda s: (s[0] - pos[0]) ** 2 + (s[1] - pos[1]) ** 2)
+        reste.remove(pos)
+        chemin.append(pos)
+    return chemin
+
+
+def vers_metres(X, Y, cal=CALAGE_CARTE):
+    """Pixels de l'image de la carte -> mètres du replay (inverse de vers_carte)."""
+    a, b, c, d = ORIENT[cal["o"]]
+    u, v = (X - cal["tx"]) / cal["s"], (Y - cal["ty"]) / cal["s"]
+    return a * u + c * v, b * u + d * v  # matrices d'orientation orthogonales : inverse = transposée
+
+
+def localiser(mini, carte, avant=None):
+    """Cherche la minicarte du jeu dans l'image de la carte (même dessin). Renvoie (ressemblance, échelle,
+    centre en pixels de la carte). avant = résultat précédent : on ne cherche qu'autour, bien plus vite."""
+    if avant:
+        _, f0, (cx, cy) = avant
+        echelles, marge = np.arange(f0 - 0.02, f0 + 0.021, 0.01), 60
+    else:  # recherche grossière sur toute la carte réduite 4 fois, puis fine autour du meilleur endroit
+        petite = cv2.resize(carte, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+        grossier = None
+        for f in np.arange(0.20, 1.60, 0.03):
+            tpl = cv2.resize(mini, None, fx=f / 4, fy=f / 4, interpolation=cv2.INTER_AREA)
+            if min(tpl.shape[:2]) < 12 or tpl.shape[0] >= petite.shape[0] or tpl.shape[1] >= petite.shape[1]:
+                continue
+            r = cv2.matchTemplate(petite, tpl, cv2.TM_CCOEFF_NORMED)
+            _, mx, _, (x, y) = cv2.minMaxLoc(r)
+            if not grossier or mx > grossier[0]:
+                grossier = (mx, f, ((x + tpl.shape[1] / 2) * 4, (y + tpl.shape[0] / 2) * 4))
+        if not grossier:
+            return None
+        _, f0, (cx, cy) = grossier
+        echelles, marge = np.arange(f0 - 0.03, f0 + 0.031, 0.01), 24
+    best = None
+    for f in echelles:
+        tpl = cv2.resize(mini, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+        h, w = tpl.shape[:2]
+        x0, y0 = int(max(0, cx - w / 2 - marge)), int(max(0, cy - h / 2 - marge))
+        zone = carte[y0:y0 + h + 2 * marge, x0:x0 + w + 2 * marge]
+        if zone.shape[0] < h or zone.shape[1] < w:
+            continue
+        r = cv2.matchTemplate(zone, tpl, cv2.TM_CCOEFF_NORMED)
+        _, mx, _, (x, y) = cv2.minMaxLoc(r)
+        if not best or mx > best[0]:
+            best = (mx, f, (x0 + x + w / 2, y0 + y + h / 2))
+    return best
+
+
+def suivre_minicarte(etat):
+    """Option minicarte : ta position vient de la minicarte du jeu, lue à l'écran (comme le message « +XP COFFRE ») et
+    retrouvée dans l'image de la carte. Les coffres ouverts cette partie sont ceux comptés à l'écran, à ta position."""
+    zone = lire_json(MINICARTE_ZONE)
+    image = next((f for f in sorted(DATA.glob("carte.*")) if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")), None)
+    etat["spots"] = spots_carte(lire_json(POSITIONS, {}) or {})
+    if not zone or not image or not etat["spots"]:
+        print(T("Minicarte : lance d'abord  py compteur_coffres.py carte  puis  py compteur_coffres.py minicarte-config",
+                "Minimap: first run  py compteur_coffres.py map  then  py compteur_coffres.py minimap-setup"))
+        return
+    carte_img = cv2.imread(str(image))
+    avant, ouverts, partie, vus = None, [], None, len(etat["detections"])
+    with MSS() as sct:
+        mon = sct.monitors[ECRAN]
+        region = {"left": mon["left"] + zone["x"], "top": mon["top"] + zone["y"], "width": zone["w"], "height": zone["h"]}
+        while not etat.get("fin"):
+            mini = cv2.cvtColor(np.array(sct.grab(region)), cv2.COLOR_BGRA2BGR)
+            trouve = localiser(mini, carte_img, avant)
+            if avant and (not trouve or trouve[0] < 0.5):  # perdu (téléportation, carte ouverte...) : on cherche partout
+                trouve = localiser(mini, carte_img)
+            avant = trouve if trouve and trouve[0] >= 0.5 else None
+            if etat.get("debut_partie") != partie:  # nouvelle partie : plus aucun coffre ouvert
+                partie, ouverts = etat.get("debut_partie"), []
+            pos = vers_metres(*avant[2]) if avant else None
+            if pos and len(etat["detections"]) > vus:  # coffre compté à l'écran : ouvert ici
+                ouverts.append(pos)
+            vus = len(etat["detections"])
+            etat["minimap"] = {"pos": pos, "ouverts": list(ouverts)} if pos else None
+            if DEBUG and avant:
+                print(f"  minicarte : {pos[0]:.0f}, {pos[1]:.0f} m (ressemblance {avant[0]:.2f}, échelle {avant[1]:.2f})")
+            time.sleep(0.5)
+
+
+def carte():
+    """Option carte : génère data/carte.html (spots de coffres, dernière partie, chemin conseillé) et l'ouvre.
+    Un spot vient de n'importe quel joueur visible dans tes replays, pas seulement de toi."""
+    import webbrowser
+
+    dotnet = verifier_replays()
+    if not dotnet:
+        return
+    positions = lire_positions(dotnet, lire_json(POSITIONS, {}) or {})
+    if not positions:
+        print(T("Aucune partie avec positions. Le lecteur est peut-être ancien : recompile-le (lecteur_src\\build.bat).",
+                "No match with positions. The reader may be outdated: rebuild it (lecteur_src\\build.bat)."))
+        return
+    spots = spots_carte(positions)
+    derniere = list(positions.values())[-1]
+    image = next((f.name for f in sorted(DATA.glob("carte.*")) if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")), None)
+    donnees = {
+        "image": image,
+        "parties": len(positions),
+        "ouvertures": sum(len(p["tous"]) for p in positions.values()),
+        "spots": spots,
+        "partie": {"joueur": derniere["joueur"], "coffres": derniere["coffres"]},
+        "calage": CALAGE_CARTE,
+    }
+    # "<" échappé : les données ne peuvent pas fermer la balise <script> de la page
+    modele = (DOSSIER / "carte_modele.html").read_text(encoding="utf-8")
+    CARTE.write_text(modele.replace("/*DONNEES*/null", json.dumps(donnees).replace("<", "\\u003c")), encoding="utf-8")
+    print(T(f"✔ Carte : {CARTE}", f"✔ Map: {CARTE}"))
+    webbrowser.open(CARTE.as_uri())
+
+
 # ---------- compteur à l'écran ----------
 def lancer_overlay(etat):
     """Fenêtre toujours au-dessus du jeu, que les clics traversent."""
@@ -444,6 +673,59 @@ def lancer_overlay(etat):
     token = tk.Label(ligne3, fg=GRIS, bg=FOND, font=("Segoe UI", 11, "bold"))
     token.pack(side="left")
 
+    # 4) option minicarte : carte autour de toi et les 3 prochains coffres
+    if MINICARTE:
+        import base64
+        taille = 240
+        fond_carte = next((cv2.imread(str(f)) for f in sorted(DATA.glob("carte.*"))
+                           if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")), None)
+        tk.Frame(cadre, bg="#3a3a4e", height=1).pack(fill="x", pady=(6, 3))
+        mini = tk.Canvas(cadre, width=taille, height=taille, bg="#12121a", highlightthickness=0)
+        mini.pack()
+        etapes = tk.Label(cadre, fg="white", bg=FOND, font=("Consolas", 11, "bold"), justify="left")
+        etapes.pack(anchor="w")
+
+    def dessiner_minicarte(m):
+        mini.delete("all")
+        if not m:
+            etapes.config(text=T("Minicarte : position introuvable", "Minimap: position not found"))
+            return
+        cx, cy = vers_carte(*m["pos"])
+        demi = MINIMAP_METRES / 2 * CALAGE_CARTE["s"]
+        k = taille / (2 * demi)
+
+        def ecran(x, y):
+            X, Y = vers_carte(x, y)
+            return (X - cx) * k + taille / 2, (Y - cy) * k + taille / 2
+
+        if fond_carte is not None:
+            d = int(2 * demi)  # bordure noire : la zone peut dépasser du bord de l'image
+            x0, y0 = int(cx - demi) + d, int(cy - demi) + d
+            zone = cv2.copyMakeBorder(fond_carte, d, d, d, d, cv2.BORDER_CONSTANT)[y0:y0 + d, x0:x0 + d]
+            if zone.size:
+                png = cv2.imencode(".png", cv2.resize(zone, (taille, taille)))[1]
+                vu["image"] = tk.PhotoImage(data=base64.b64encode(png.tobytes()))
+                mini.create_image(0, 0, image=vu["image"], anchor="nw")
+        for x, y, *_ in etat["spots"]:
+            X, Y = ecran(x, y)
+            if 0 <= X <= taille and 0 <= Y <= taille:
+                mini.create_oval(X - 3, Y - 3, X + 3, Y + 3, fill="#ffb020", outline="#000")
+        for x, y in m["ouverts"]:
+            X, Y = ecran(x, y)
+            mini.create_line(X - 4, Y - 4, X + 4, Y + 4, fill="#ff4040", width=2)
+            mini.create_line(X - 4, Y + 4, X + 4, Y - 4, fill="#ff4040", width=2)
+        route = prochains(m["pos"], etat["spots"], m["ouverts"])
+        points = [m["pos"]] + route
+        if len(points) > 1:
+            mini.create_line(*[v for q in points for v in ecran(*q)], fill="#3fa9ff", width=3)
+        for i, q in enumerate(route, 1):
+            X, Y = ecran(*q)
+            mini.create_text(X + 9, Y - 9, text=str(i), fill="white", font=("Segoe UI", 11, "bold"))
+        mini.create_oval(taille / 2 - 6, taille / 2 - 6, taille / 2 + 6, taille / 2 + 6, fill="#3fa9ff", outline="white", width=2)
+        dist = [math.dist(points[i], points[i + 1]) for i in range(len(route))]
+        texte = "  ".join(f"{i + 1}:{'+' if i else ''}{round(v)}m" for i, v in enumerate(dist))
+        etapes.config(text=texte)
+
     # Clics à travers la fenêtre (Windows)
     try:
         import ctypes
@@ -478,6 +760,9 @@ def lancer_overlay(etat):
         if vu["flash"]:
             vu["flash"] -= 1
             ouverts.config(fg=DORE if vu["flash"] else "white")
+        if MINICARTE and etat.get("minimap") is not vu.get("mini", 0):  # redessinée seulement quand elle change
+            vu["mini"] = etat.get("minimap")
+            dessiner_minicarte(vu["mini"])
         root.attributes("-topmost", True)
         root.after(100, rafraichir)
 
@@ -514,6 +799,9 @@ def compter():
 
     threading.Thread(target=surveiller, args=(etat, zone, modele), daemon=True).start()
     threading.Thread(target=analyser_replays, args=(etat,), daemon=True).start()
+    if MINICARTE:
+        etat["spots"] = []
+        threading.Thread(target=suivre_minicarte, args=(etat,), daemon=True).start()
     print(T(f"Surveillance en cours... total : {etat['total']}  (F8 +1, F7 -1, F10 quitter)",
             f"Watching... total: {etat['total']}  (F8 +1, F7 -1, F10 quit)"))
 
@@ -544,6 +832,10 @@ def main():
 
     if "calibrer" in ARGS or "calibrate" in ARGS:
         calibrer()
+    elif "minicarte-config" in ARGS or "minimap-setup" in ARGS:
+        configurer_minicarte()
+    elif "carte" in ARGS or "map" in ARGS:
+        carte()
     else:
         compter()
 
