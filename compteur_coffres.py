@@ -69,6 +69,9 @@ CHANCE_TOKEN = 1 / 137_500
 CALAGE_CARTE = {"o": 0, "s": 0.85, "tx": 811, "ty": 786}
 ORIENT = [(1, 0, 0, 1), (0, -1, 1, 0), (-1, 0, 0, -1), (0, 1, -1, 0), (-1, 0, 0, 1), (0, 1, 1, 0), (1, 0, 0, -1), (0, -1, -1, 0)]
 MINIMAP_METRES = 300         # côté de la zone affichée par la minicarte en direct
+# Pixels de la carte par pixel de la minicarte du jeu (0,89 mesuré en 2560 x 1440). Bornes larges pour les autres
+# résolutions, mais jamais près de 0 : une minicarte réduite à quelques pixels ressemble à n'importe quoi.
+ECHELLE_MINI = (0.4, 1.6)
 
 ARGS = [a.lower() for a in sys.argv[1:]]
 DEBUG = "debug" in ARGS
@@ -525,13 +528,15 @@ def vers_metres(X, Y, cal=CALAGE_CARTE):
 def localiser(mini, carte, avant=None):
     """Cherche la minicarte du jeu dans l'image de la carte (même dessin). Renvoie (ressemblance, échelle,
     centre en pixels de la carte). avant = résultat précédent : on ne cherche qu'autour, bien plus vite."""
+    if cv2.meanStdDev(mini)[1].max() < 10:  # image presque unie (pleine mer, écran de chargement) : elle "ressemble" à tout
+        return None
     if avant:
         _, f0, (cx, cy) = avant
         echelles, marge = np.arange(f0 - 0.02, f0 + 0.021, 0.01), 60
     else:  # recherche grossière sur toute la carte réduite 4 fois, puis fine autour du meilleur endroit
         petite = cv2.resize(carte, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
         grossier = None
-        for f in np.arange(0.20, 1.60, 0.03):
+        for f in np.arange(*ECHELLE_MINI, 0.03):
             tpl = cv2.resize(mini, None, fx=f / 4, fy=f / 4, interpolation=cv2.INTER_AREA)
             if min(tpl.shape[:2]) < 12 or tpl.shape[0] >= petite.shape[0] or tpl.shape[1] >= petite.shape[1]:
                 continue
@@ -544,7 +549,7 @@ def localiser(mini, carte, avant=None):
         _, f0, (cx, cy) = grossier
         echelles, marge = np.arange(f0 - 0.03, f0 + 0.031, 0.01), 24
     best = None
-    for f in echelles:
+    for f in np.clip(echelles, *ECHELLE_MINI):  # le suivi ne peut pas faire dériver l'échelle hors des bornes
         tpl = cv2.resize(mini, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
         h, w = tpl.shape[:2]
         x0, y0 = int(max(0, cx - w / 2 - marge)), int(max(0, cy - h / 2 - marge))
@@ -575,6 +580,17 @@ def trouver(mini, cartes, avant):
     return None
 
 
+def suivre(mini, cartes, avant, verifier):
+    """Position suivante. Le suivi rapide ne cherche qu'autour de la position précédente et peut rester accroché
+    à un faux endroit : avec verifier, on refait aussi une recherche sur toute la carte et on garde la meilleure."""
+    rapide = trouver(mini, cartes, avant)
+    if verifier and avant:
+        complet = trouver(mini, cartes, None)
+        if complet and (not rapide or complet[0] >= rapide[0]):  # la recherche complète voit tout : elle gagne à égalité
+            return complet
+    return rapide
+
+
 def suivre_minicarte(etat):
     """Option minicarte : ta position vient de la minicarte du jeu, lue à l'écran (comme le message « +XP COFFRE ») et
     retrouvée dans l'image de la carte. Les coffres ouverts cette partie sont ceux comptés à l'écran, à ta position."""
@@ -587,13 +603,16 @@ def suivre_minicarte(etat):
         return
     carte_img = cv2.imread(str(image))
     cartes = (carte_img, contraste(carte_img))
-    avant, ouverts, partie, vus = None, [], None, len(etat["detections"])
+    avant, ouverts, partie, vus, tour = None, [], None, len(etat["detections"]), 0
     with MSS() as sct:
         mon = sct.monitors[ECRAN]
         region = {"left": mon["left"] + zone["x"], "top": mon["top"] + zone["y"], "width": zone["w"], "height": zone["h"]}
         while not etat.get("fin"):
             mini = cv2.cvtColor(np.array(sct.grab(region)), cv2.COLOR_BGRA2BGR)
-            avant = trouver(mini, cartes, avant)
+            avant = suivre(mini, cartes, avant, verifier=tour % 6 == 0)
+            tour += 1
+            if DEBUG:  # dernière image de la minicarte, pour comprendre une position fausse
+                cv2.imwrite(str(DATA / "minicarte_debug.png"), mini)
             if etat.get("debut_partie") != partie:  # nouvelle partie : plus aucun coffre ouvert
                 partie, ouverts = etat.get("debut_partie"), []
             pos = vers_metres(*avant[2]) if avant else None
